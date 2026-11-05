@@ -279,7 +279,8 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
         with torch.no_grad():
             if opts.feature_network is None:
-                features = detector(images.to(opts.device), **detector_kwargs)
+                images_float = images.to(opts.device, dtype=torch.float32)
+                features = detector(images_float, **detector_kwargs)
                 if sfid:
                     features = activation['mixed6_conv'][:, :7].flatten(1)
             else:
@@ -339,7 +340,8 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
 
         with torch.no_grad():
             if opts.feature_network is None:
-                features = detector(images.to(opts.device), **detector_kwargs)
+                images_float = images.to(opts.device, dtype=torch.float32)
+                features = detector(images_float, **detector_kwargs)
                 if sfid:
                     features = activation['mixed6_conv'][:, :7].flatten(1)
             else:
