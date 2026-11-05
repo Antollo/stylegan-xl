@@ -25,6 +25,7 @@ import legacy
 from pg_modules.blocks import Interpolate
 import timm
 from pg_modules.projector import get_backbone_normstats
+from training.sd_loss import SDLoss
 
 #----------------------------------------------------------------------------
 
@@ -63,6 +64,19 @@ class ProjectedGANLoss(Loss):
         self.cls_weight = cls_weight
         self.cls_guidance_loss = torch.nn.CrossEntropyLoss()
 
+        #self.sd_loss_weight = 200.0 #kwargs.get('sd_loss', 0.0) # kwargs.get('sd_aug', False)
+        #self.sd_ramp_kimg = 300 # kwargs.get('sd_ramp_kimg', self.blur_fade_kimg)
+        #loss_type = 'lpips' # 'lpips' # kwargs.get('sd_loss_type', 'lpips')
+        #self.sd_loss_module = SDLoss(device, use_aug=True, loss_type=loss_type)
+        
+        self.sd_loss_weight = kwargs.get('sd_loss', 0.0)
+        self.sd_ramp_kimg = self.blur_fade_kimg if kwargs.get('sd_ramp', True) else 0
+        loss_type = kwargs.get('sd_loss_type', 'lpips')
+        sd_aug = kwargs.get('sd_aug', True)
+        self.sd_loss_module = SDLoss(device, use_aug=sd_aug, loss_type=loss_type)
+        
+        print("sd_loss_weight", self.sd_loss_weight, "sd_ramp_kimg", self.sd_ramp_kimg, loss_type)
+
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
         if self.style_mixing_prob > 0:
@@ -71,6 +85,16 @@ class ProjectedGANLoss(Loss):
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
         img = self.G.synthesis(ws, update_emas=False)  # enabling emas leads to collapse with PG
+        return img, ws
+
+    def run_G_ema(self, z, c, update_emas=False):
+        ws = self.G_ema.mapping(z, c, update_emas=update_emas)
+        if self.style_mixing_prob > 0:
+            with torch.autograd.profiler.record_function('style_mixing'):
+                cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
+                cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
+                ws[:, cutoff:] = self.G_ema.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
+        img = self.G_ema.synthesis(ws, update_emas=False)  # enabling emas leads to collapse with PG
         return img, ws
 
     def run_D(self, img, c, blur_sigma=0, update_emas=False):
@@ -101,11 +125,31 @@ class ProjectedGANLoss(Loss):
                     getattr(self.G.synthesis, name).requires_grad_(name in self.G.head_layer_names)
 
             with torch.autograd.profiler.record_function('Gmain_forward'):
+                # Save RNG state so run_G_ema sees identical random noise as run_G
+                pre_g_rng_cpu = torch.random.get_rng_state()
+                pre_g_rng_cuda = torch.cuda.get_rng_state(gen_z.device)
+
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c)
+
+                # Save RNG state after run_G so downstream operations (like run_D) are not corrupted
+                post_g_rng_cpu = torch.random.get_rng_state()
+                post_g_rng_cuda = torch.cuda.get_rng_state(gen_z.device)
+
+                with torch.no_grad():
+                    torch.random.set_rng_state(pre_g_rng_cpu)
+                    torch.cuda.set_rng_state(pre_g_rng_cuda, gen_z.device)
+                    gen_img_ema, _ = self.run_G_ema(gen_z, gen_c)
+
+                # Restore RNG state to post-G state
+                torch.random.set_rng_state(post_g_rng_cpu)
+                torch.cuda.set_rng_state(post_g_rng_cuda, gen_z.device)
+
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
 
                 loss_Gmain = sum([(-l).mean() for l in gen_logits])
                 gen_logits = torch.cat(gen_logits)
+
+                loss_G_sd = self.sd_loss_module(gen_img, gen_img_ema)
 
                 if self.cls_weight:
                     gen_img = self.norm(gen_img.add(1).div(2)) 
@@ -113,12 +157,20 @@ class ProjectedGANLoss(Loss):
                     loss_Gmain += self.cls_weight * guidance_loss
                     training_stats.report('Loss/G/guidance_loss', guidance_loss)
 
+                sd_ramp = max(min((cur_nimg - self.sd_ramp_kimg * 1e3) / (self.sd_ramp_kimg * 1e3), 1.0), 0.0) if self.sd_ramp_kimg > 0 else 1.0
+                sd_weight = self.sd_loss_weight * sd_ramp
+
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
                 training_stats.report('Loss/G/loss', loss_Gmain)
+                training_stats.report('Loss/G/loss_sd', loss_G_sd)
+                training_stats.report('Loss/G/sd_weight', sd_weight)
 
             with torch.autograd.profiler.record_function('Gmain_backward'):
-                loss_Gmain.backward()
+                if sd_weight > 0:
+                    (loss_Gmain + loss_G_sd * sd_weight).backward()
+                else:
+                    loss_Gmain.backward()
 
         # Gpl: Apply path length regularization.
         start_plreg = (cur_nimg >= 1e6)

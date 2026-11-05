@@ -174,6 +174,13 @@ def parse_comma_separated_list(s):
 @click.option('--cls_weight',   help='class guidance weight', type=float, default=0.0, show_default=True)
 @click.option('--up_factor',    help='Up sampling factor of superres head', type=click.IntRange(min=2), default=2, show_default=True)
 
+# Self-distillation loss.
+@click.option('--sd-loss',      help='Self-distillation loss weight [default: 0.0]', metavar='FLOAT', type=float, default=0.0, show_default=True)
+@click.option('--sd-loss-type', help='Self-distillation loss type [default: lpips]', type=click.Choice(['lpips', 'msssim', 'l1', 'l2']), default='lpips', show_default=True)
+@click.option('--sd-aug',       help='Self-distillation augmentation [default: true]', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--sd-ramp',      help='Enable self-distillation ramp using blur_fade_kimg [default: true]', metavar='BOOL', type=bool, default=True, show_default=True)
+
+
 def main(**kwargs):
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs)  # Command line arguments
@@ -296,6 +303,10 @@ def main(**kwargs):
     c.loss_kwargs.cls_weight = 0.0  # use classifier guidance only for superresolution training (i.e., with pretrained stem)
     c.loss_kwargs.cls_model = 'deit_small_distilled_patch16_224'
     c.loss_kwargs.train_head_only = False
+    c.loss_kwargs.sd_loss = opts.sd_loss
+    c.loss_kwargs.sd_loss_type = opts.sd_loss_type
+    c.loss_kwargs.sd_aug = opts.sd_aug
+    c.loss_kwargs.sd_ramp = opts.sd_ramp
 
     if opts.superres:
         assert opts.path_stem is not None, "When training superres head, provide path to stem"

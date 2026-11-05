@@ -171,6 +171,13 @@ def training_loop(
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
 
+    # Synchronize all parameters and buffers from rank 0 to ensure
+    # randomly-initialized buffers (e.g. noise_const) are identical across GPUs.
+    if num_gpus > 1:
+        for module in [G, D, G_ema]:
+            for tensor in misc.params_and_buffers(module):
+                torch.distributed.broadcast(tensor, src=0)
+
     # Check for existing checkpoint
     ckpt_pkl = None
     if restart_every > 0 and os.path.isfile(misc.get_ckpt_path(run_dir)):
